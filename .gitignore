@@ -1,0 +1,14 @@
+# Google Drive credentials
+credentials.json
+token.json
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Application folders
+Pending_Uploads/
+Completed_Uploads/
+
+# Dummy files
+dummy.txt
