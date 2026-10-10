@@ -1,5 +1,7 @@
 import os
 import shutil
+import time
+import socket
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -59,29 +61,45 @@ def create_drive_folder(service, folder_name, parent_folder_id=None):
 
 
 def upload_file(service, local_file_path, drive_folder_id=None):
-    """Uploads a file to Google Drive using a resumable upload."""
+    """Uploads a file to Google Drive using a resumable upload with chunking and retries."""
     try:
         file_name = os.path.basename(local_file_path)
         file_metadata = {'name': file_name}
         if drive_folder_id:
             file_metadata['parents'] = [drive_folder_id]
 
-        media = MediaFileUpload(local_file_path, resumable=True)
+        # Use chunking to make it more resilient (e.g., 5MB chunks)
+        media = MediaFileUpload(local_file_path, resumable=True, chunksize=1024*1024*5)
         
-        file = service.files().create(
+        request = service.files().create(
             body=file_metadata,
             media_body=media,
             fields='id'
-        ).execute()
+        )
         
-        file_id = file.get('id')
+        response = None
+        retries = 0
+        max_retries = 5
+        
+        while response is None:
+            try:
+                status, response = request.next_chunk()
+                if status:
+                    print(f"Uploading '{file_name}'... {int(status.progress() * 100)}%")
+                retries = 0  # reset retries on success
+            except (HttpError, socket.error, OSError) as e:
+                retries += 1
+                if retries > max_retries:
+                    print(f"Failed to upload '{file_name}' after {max_retries} retries. Error: {e}")
+                    return None
+                print(f"Connection error occurred: {e}. Retrying {retries}/{max_retries} in {2 ** retries} seconds...")
+                time.sleep(2 ** retries)
+        
+        file_id = response.get('id')
         print(f"File '{file_name}' uploaded successfully.")
         return file_id
-    except HttpError as error:
-        print(f"An HTTP error occurred uploading the file: {error}")
-        return None
     except Exception as error:
-        print(f"An unexpected error occurred uploading the file: {error}")
+        print(f"An unexpected error occurred setting up the upload: {error}")
         return None
 
 
