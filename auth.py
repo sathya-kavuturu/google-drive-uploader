@@ -2,6 +2,7 @@ import os
 import shutil
 import time
 import socket
+import concurrent.futures
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -13,7 +14,7 @@ from googleapiclient.errors import HttpError
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
 def authenticate_google_drive():
-    """Authenticates the user and returns the Drive API service."""
+    """Authenticates the user and returns the Drive credentials."""
     creds = None
     if os.path.exists('token.json'):
         creds = Credentials.from_authorized_user_file('token.json', SCOPES)
@@ -30,11 +31,14 @@ def authenticate_google_drive():
         with open('token.json', 'w') as token:
             token.write(creds.to_json())
 
+    return creds
+
+
+def get_drive_service(creds):
     try:
-        service = build('drive', 'v3', credentials=creds)
-        return service
+        return build('drive', 'v3', credentials=creds)
     except Exception as error:
-        print(f"An error occurred during authentication: {error}")
+        print(f"An error occurred building the service: {error}")
         return None
 
 
@@ -68,8 +72,8 @@ def upload_file(service, local_file_path, drive_folder_id=None):
         if drive_folder_id:
             file_metadata['parents'] = [drive_folder_id]
 
-        # Use chunking to make it more resilient (e.g., 5MB chunks)
-        media = MediaFileUpload(local_file_path, resumable=True, chunksize=1024*1024*5)
+        # Use larger chunking for faster uploads (e.g., 50MB chunks)
+        media = MediaFileUpload(local_file_path, resumable=True, chunksize=1024*1024*50)
         
         request = service.files().create(
             body=file_metadata,
@@ -145,43 +149,50 @@ def get_target_folder(service):
             print("Invalid input. Please enter a valid number.")
 
 
-def process_upload(service, local_path, drive_parent_id, completed_base_dir):
+def prepare_upload_tasks(service, local_path, drive_parent_id, completed_base_dir, tasks):
     """
-    Recursively uploads files and directories to Drive and moves them locally to completed_base_dir.
+    Recursively creates folders in Drive and collects a list of file tasks for concurrent uploading.
     """
     item_name = os.path.basename(local_path)
     
     if os.path.isfile(local_path):
-        # It's a standalone file
-        file_id = upload_file(service, local_path, drive_parent_id)
-        if file_id:
-            # Move file to Completed_Uploads
-            dest_path = os.path.join(completed_base_dir, item_name)
-            os.makedirs(completed_base_dir, exist_ok=True)
-            try:
-                shutil.move(local_path, dest_path)
-                print(f"Moved locally: '{item_name}' -> Completed_Uploads")
-            except Exception as e:
-                print(f"Warning: Could not move file {local_path}: {e}")
+        dest_path = os.path.join(completed_base_dir, item_name)
+        tasks.append({
+            'local_path': local_path,
+            'drive_parent_id': drive_parent_id,
+            'dest_path': dest_path
+        })
                 
     elif os.path.isdir(local_path):
-        # It's a folder, replicate in Google Drive
         new_drive_folder_id = create_drive_folder(service, item_name, drive_parent_id)
         if new_drive_folder_id:
             new_completed_base = os.path.join(completed_base_dir, item_name)
             os.makedirs(new_completed_base, exist_ok=True)
             
-            # Iterate through the directory contents
             for sub_item in os.listdir(local_path):
                 sub_item_path = os.path.join(local_path, sub_item)
-                process_upload(service, sub_item_path, new_drive_folder_id, new_completed_base)
+                prepare_upload_tasks(service, sub_item_path, new_drive_folder_id, new_completed_base, tasks)
             
-            # Clean up empty local directory
-            if not os.listdir(local_path):
-                try:
-                    os.rmdir(local_path)
-                except Exception as e:
-                    print(f"Warning: Could not remove empty folder {local_path}: {e}")
+            # We won't clean up empty directories here since uploads are happening asynchronously later.
+
+
+def worker_upload(creds, task):
+    """Worker function to upload a single file."""
+    # Build a new service object per thread as googleapiclient is not fully thread-safe
+    service = get_drive_service(creds)
+    if not service:
+        return
+        
+    local_path = task['local_path']
+    file_id = upload_file(service, local_path, task['drive_parent_id'])
+    if file_id:
+        dest_path = task['dest_path']
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        try:
+            shutil.move(local_path, dest_path)
+            print(f"Moved locally: '{os.path.basename(local_path)}' -> Completed_Uploads")
+        except Exception as e:
+            print(f"Warning: Could not move file {local_path}: {e}")
 
 
 def main():
@@ -200,9 +211,14 @@ def main():
         return
         
     # Authenticate
-    service = authenticate_google_drive()
-    if not service:
+    creds = authenticate_google_drive()
+    if not creds:
         print("Authentication failed. Exiting.")
+        return
+        
+    service = get_drive_service(creds)
+    if not service:
+        print("Failed to build service. Exiting.")
         return
         
     # Trigger interactive menu
@@ -211,13 +227,36 @@ def main():
         print("No valid target folder selected. Exiting.")
         return
         
-    print(f"\n--- Starting Upload Process ---")
+    print(f"\n--- Preparing Upload Tasks ---")
     
-    # Process everything in Pending_Uploads
+    upload_tasks = []
+    # Collect all tasks
     for item in items_to_upload:
         item_path = os.path.join(pending_dir, item)
-        process_upload(service, item_path, target_folder_id, completed_dir)
+        prepare_upload_tasks(service, item_path, target_folder_id, completed_dir, upload_tasks)
         
+    if not upload_tasks:
+        print("No files found to upload.")
+        return
+
+    print(f"Found {len(upload_tasks)} files to upload. Starting concurrent uploads...")
+    
+    # Upload files concurrently using ThreadPoolExecutor
+    max_workers = min(10, len(upload_tasks))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(worker_upload, creds, task) for task in upload_tasks]
+        concurrent.futures.wait(futures)
+
+    # Clean up empty directories in Pending_Uploads after all uploads finish
+    for root, dirs, files in os.walk(pending_dir, topdown=False):
+        for name in dirs:
+            dir_path = os.path.join(root, name)
+            if not os.listdir(dir_path):
+                try:
+                    os.rmdir(dir_path)
+                except Exception as e:
+                    pass
+                    
     print("\nUpload process complete! All successfully uploaded items have been moved to 'Completed_Uploads'.")
 
 if __name__ == '__main__':
